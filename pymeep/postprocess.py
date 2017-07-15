@@ -13,25 +13,110 @@
     #along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 from __future__ import division, print_function
-from os import path, environ, remove, rename, mkdir
-import sys
-from shutil import rmtree
-import subprocess as sp
-import re
+from os import path
 import numpy as np
 from matplotlib import pyplot as plt
-from matplotlib import cm
+from matplotlib.widgets import Button
 from scipy.interpolate import InterpolatedUnivariateSpline
-import defaults
-from datetime import datetime
-import time
 import glob
 import log
 
+class PlotOverlay:
+    def __init__(self):
+        """A simple class that adds scatter points connected with an interpolated spline to a plot"""
+        self.values = None
+        self.scat = None
+        self.interp_curve = None
+        self.ax = None
+        self.color = None
+
+    def __del__(self):
+        if self.scat:
+            self.scat.remove()
+        if self.interp_curve:
+            self.interp_curve.remove()
+
+    def add_to_axis(self, axis, color=None):
+        if axis is None:
+            return
+        self.ax = axis
+        if color is None:
+            if self.color is None:
+                self.color = self.ax._get_patches_for_fill.get_next_color()
+        else:
+            self.color = color
+            # TODO: if color changes when already plotted, update self.scat and self.interp_curve
+
+        if self.values is not None:
+            self.update_plot()
+            self.update_interpolation_curve()
+
+    def set_data(self, data):
+        """data values of -1 will be masked, i.e. not plotted"""
+        self.values = np.copy(data)
+        self.update_plot()
+        self.update_interpolation_curve()
+
+    def has_data(self):
+        return self.values is not None and len(self.values) > 0 and np.any(self.values != -1)
+
+    def update_plot(self):
+        if self.ax is None:
+            return
+        X = np.nonzero(self.values != -1)[0]
+        if self.scat is None:
+            # create new scatter plot:
+            self.scat = self.ax.scatter(
+                X, self.values[X], facecolors='none', s=100, edgecolors=self.color)
+        else:
+            # update scatter plot:
+            self.scat.set_offsets(np.stack((X, self.values[X])).T)
+
+    def update_interpolation_curve(self):
+        if self.ax is None:
+            return
+        X = np.nonzero(self.values != -1)[0]
+        if len(X) <= 3:
+            # too little points. Don't plot / remove plot:
+            if self.interp_curve is not None:
+                self.interp_curve.remove()
+                self.interp_curve = None
+            return
+
+        # interpolate data, using cubic spline:
+        try:
+            f_interp = InterpolatedUnivariateSpline(X, self.values[X], k=3)
+        except:
+            raise ValueError('could not interpolate', X, self.values[X])
+        # small steps in x for the interpolated curve:
+        xs = np.linspace(0, len(self.values), 400)
+        ys = f_interp(xs)
+        # plot/update interpolated curve:
+        if self.interp_curve is None:
+            self.interp_curve, = self.ax.plot(
+                xs, ys, ':', color=self.color,
+                lw=2, alpha=0.7, label='interpolated')
+        else:
+            self.interp_curve.set_data(xs, ys)
+
 
 class ModePicker:
-    def __init__(self, outfile, modefile='W1mode1.dat'):
+    def __init__(self, outfile, modefile='bands.dat'):
+        """Load band diagram data from meep output file. Call the plot method
+        to manually select and show frequencies belonging to a band.
 
+        param outfile:
+            the meep output
+        param modefile:
+            File where the picked mode frequencies are saved to or are loaded from.
+            Frequencies for every k-vec are space-separated, while each line
+            corresponds to a band.
+            The file must not exist, it will be created when the band freqs are saved.
+
+        In both filenames, you may use wildcards (*, ?), but this will only find
+        existing files (modefile will be overwritten!)
+
+        """
         if glob.has_magic(outfile):
             names = glob.glob(outfile)
             if len(names) == 0:
@@ -40,33 +125,31 @@ class ModePicker:
                 print('Warning: Globbing found multiple matching filenames, but will only use first one: %s' % names[0])
             # only load the first one found:
             outfile = names[0]
-
         self.outfile = outfile
-        self.modefile = path.join(path.dirname(self.outfile), modefile)
+        dirname = path.dirname(self.outfile)
+
+        if glob.has_magic(modefile):
+            names = glob.glob(path.join(dirname, modefile))
+            if len(names) == 0:
+                raise BaseException("Could not find file: %s" % modefile)
+            elif len(names) > 1:
+                print('Warning: Globbing found multiple matching filenames, but will only use first one: %s' % names[0])
+            self.modefile = names[0]
+        else:
+            self.modefile = path.join(dirname, modefile)
+
         self.kdata, self.hdata = load_bands_data(outfile, freq_tolerance=-1, phase_tolerance=1001)
-        self.mode_freqs = np.ones((self.kdata.shape[0])) * -1
+        self.bands = [PlotOverlay()]
+        self.current_band_index = 0
+        self.active_band = self.bands[-1]
         self.fig = None
         self.ax = None
-        self.scat = None
-        self.interp_curve = None
         self.load_mode_freqs()
 
     def __del__(self):
         if self.fig is not None:
             plt.close(self.fig)
             self.fig = None
-
-    def update_plot_with_picked_data(self):
-        if self.ax is None:
-            return
-        X = np.nonzero(self.mode_freqs != -1)[0]
-        if self.scat is None:
-            # create new scatter plot:
-            self.scat = self.ax.scatter(X, self.mode_freqs[X], facecolors='none', edgecolors='r', s=100)
-        else:
-            # update scatter plot:
-            self.scat.set_offsets(np.stack((X, self.mode_freqs[X])).T)
-        self.update_interpolation_curve()
 
     def on_pick(self, event):
         # get event data:
@@ -99,16 +182,53 @@ class ModePicker:
                 data[kindex] = [count + 1, fsum + freq]
 
         # merge data from multiple points on same k-vec (mean of frequencies):
-        for k, (count, fsum) in data.iteritems():
+        current = self.active_band.values
+        for k, (count, fsum) in data.items():
             # remove frequency if already in self.mode_freqs:
-            if self.mode_freqs[k] == fsum / float(count):
-                self.mode_freqs[k] = -1
+            if current[k] == fsum / float(count):
+                current[k] = -1
             else:
                 # update self.mode_freqs with new data:
-                self.mode_freqs[k] = fsum / float(count)
+                current[k] = fsum / float(count)
+        self.active_band.set_data(current)
 
         # update scatter plot:
         self.update_plot_with_picked_data()
+
+    def new_band(self, event=None):
+        count = len(self.active_band.values)
+        self.bands.append(PlotOverlay())
+        self.current_band_index = len(self.bands) - 1
+        self.active_band = self.bands[self.current_band_index]
+        self.active_band.set_data(np.ones(count) * -1)
+        self.active_band.add_to_axis(self.ax)
+        self.bcurr.label.set_text(str(self.current_band_index))
+        self.bcurr.color = self.active_band.color
+        self.bcurr.hovercolor = self.active_band.color
+        self.bcurr.ax.set_facecolor(self.active_band.color)
+        self.fig.canvas.draw_idle()
+
+    def prev_band(self, event=None):
+        self.current_band_index -= 1
+        if self.current_band_index < 0:
+            self.current_band_index = len(self.bands) - 1
+        self.active_band = self.bands[self.current_band_index]
+        self.bcurr.label.set_text(str(self.current_band_index))
+        self.bcurr.color = self.active_band.color
+        self.bcurr.hovercolor = self.active_band.color
+        self.bcurr.ax.set_facecolor(self.active_band.color)
+        self.fig.canvas.draw_idle()
+
+    def next_band(self, event=None):
+        self.current_band_index += 1
+        if self.current_band_index >= len(self.bands):
+            self.current_band_index = 0
+        self.active_band = self.bands[self.current_band_index]
+        self.bcurr.label.set_text(str(self.current_band_index))
+        self.bcurr.color = self.active_band.color
+        self.bcurr.hovercolor = self.active_band.color
+        self.bcurr.ax.set_facecolor(self.active_band.color)
+        self.fig.canvas.draw_idle()
 
     def plot(self, y_range=(0.35, 0.65), gap=None,
              coldataindex=3, coldatalabel='abs(mode amplitude)', maxq=2, show=True):
@@ -119,8 +239,31 @@ class ModePicker:
                 filename=None, show=False)
             self.ax = plt.gca()
             self.fig = plt.gcf()
-        self.update_plot_with_picked_data()
+            for band in self.bands:
+                band.add_to_axis(self.ax)
         if show:
+            size = self.fig.get_size_inches()
+            self.fig.set_size_inches([size[0], size[1] * 1.2])
+            plt.subplots_adjust(bottom=0.2)
+            axnew = plt.axes([0.04, 0.05, 0.075, 0.075])
+            axprev = plt.axes([0.135, 0.05, 0.075, 0.075])
+            axcurr = plt.axes([0.215, 0.05, 0.025, 0.075])
+            axnext = plt.axes([0.245, 0.05, 0.075, 0.075])
+            axsave = plt.axes([0.34, 0.05, 0.075, 0.075])
+
+            self.bnew = Button(axnew, 'new\nband')
+            self.bprev = Button(axprev, 'previous\nband')
+            self.bcurr = Button(
+                axcurr, str(self.current_band_index),
+                color=self.active_band.color, hovercolor=self.active_band.color)
+            self.bnext = Button(axnext, 'next\nband')
+            self.bsave = Button(axsave, 'save\nbands')
+
+            self.bnew.on_clicked(self.new_band)
+            self.bprev.on_clicked(self.prev_band)
+            self.bnext.on_clicked(self.next_band)
+            self.bsave.on_clicked(self.save_mode_freqs)
+
             plt.show()
 
     def save_plot_to_file(
@@ -133,25 +276,74 @@ class ModePicker:
             filename, transparent=False,
             bbox_inches='tight', pad_inches=0)
 
-    def save_mode_freqs(self):
-        np.savetxt(self.modefile, self.mode_freqs)
+    def save_mode_freqs(self, event=None):
+        count = len(self.bands)
+        # don't save last empty band
+        if not self.bands[-1].has_data():
+            count -= 1
+        mode_freqs = np.ones((count, len(self.bands[0].values))) * -1
+        for i in range(count):
+            mode_freqs[i] = self.bands[i].values
+        np.savetxt(self.modefile, mode_freqs)
 
     def load_mode_freqs(self):
-        if path.isfile(self.modefile):
-            self.mode_freqs = np.loadtxt(self.modefile)
-        self.update_plot_with_picked_data()
+        """load freqs from self.modefile (every line is one band, frequencies are split by spaces).
+        The current bands will be overwritten.
 
-    def has_mode_freqs(self):
-        return np.any(self.mode_freqs != -1)
+        """
+        if path.isfile(self.modefile):
+            mode_freqs = np.loadtxt(self.modefile, ndmin=2)
+        # patch to update old-style, single-band modefiles:
+        if mode_freqs.shape[0] > 1 and mode_freqs.shape[1] == 1:
+            mode_freqs = mode_freqs.T
+        count = mode_freqs.shape[0]
+        # delete excessive bands:
+        while len(self.bands) > count:
+            del self.bands[-1]
+        # add lacking bands:
+        while len(self.bands) < count:
+            self.bands.append(PlotOverlay())
+        for i, band in enumerate(self.bands):
+            band.set_data(mode_freqs[i])
+            band.add_to_axis(self.ax)
+        self.current_band_index = 0
+        self.update_plot_with_picked_data()
 
     def overlay_freqs_positions(self, mode_freqs, color='g', size=100):
         if self.ax is None:
             return
+        if isinstance(mode_freqs, PlotOverlay):
+            mode_freqs = mode_freqs.values
         X = np.nonzero(mode_freqs != -1)[0]
         return self.ax.scatter(X, mode_freqs[X], facecolors='none', edgecolors=color, s=size)
 
-    def initialize_from_approx_freqs(self, mode_freqs):
-        for k, freq in enumerate(mode_freqs[:len(self.mode_freqs)]):
+    def initialize_from_approx_freqs(self, mode_freqs, bandnum=-1):
+        """Snap frequencies provided in band_freqs to nearest mode in data with low error and high amplitude.
+        If bandnum == -1, a new band will be added (or last band overwritten if it only contains -1 freqs),
+        otherwise bandnum specifies which band to overwrite.
+
+        """
+        if isinstance(mode_freqs, PlotOverlay):
+            mode_freqs = mode_freqs.values
+        count = len(self.active_band.values)
+        if bandnum == -1 or bandnum >= len(self.bands):
+            if bandnum == -1 and not self.bands[-1].has_data():
+                # remove empty last band, but reuse color:
+                color = np.copy(self.bands[-1].color)
+                del self.bands[-1]
+            else:
+                color = None
+            self.bands.append(PlotOverlay())
+            self.bands[-1].add_to_axis(self.ax, color)
+            dest = len(self.bands) - 1
+        else:
+            dest = bandnum
+
+        self.active_band = self.bands[dest]
+        self.current_band_index = dest
+        newvals = np.ones(count) * -1
+
+        for k, freq in enumerate(mode_freqs[:count]):
             if freq == -1:
                 continue
             # maximum amplitude of modes at k, needed for normalization:
@@ -170,28 +362,16 @@ class ModePicker:
                 # log of error (which is negative) is substracted from rating:
                 rating[i] -= np.log(self.hdata[k, i, 6]) / 10
             winner = rating.argmax()
-            self.mode_freqs[k] = self.hdata[k, winner, 0]
+            newvals[k] = self.hdata[k, winner, 0]
+
+        self.active_band.set_data(newvals)
         self.update_plot_with_picked_data()
 
-    def update_interpolation_curve(self):
+    def update_plot_with_picked_data(self):
         if self.ax is None:
             return
-        X = np.nonzero(self.mode_freqs != -1)[0]
-        if len(X) < 2:
-            return
-        # interpolate data, using cubic spline:
-        try:
-            f_interp = InterpolatedUnivariateSpline(X, self.mode_freqs[X], k=3)
-        except:
-            raise ValueError('could not interpolate', X, self.mode_freqs[X])
-        # small steps in x for the interpolated curve:
-        xs = np.linspace(0, len(self.mode_freqs), 400)
-        ys = f_interp(xs)
-        # plot/update interpolated curve:
-        if self.interp_curve is None:
-            self.interp_curve, = self.ax.plot(xs, ys, ':r', lw=2, alpha=0.7, label='interpolated')
-        else:
-            self.interp_curve.set_data(xs, ys)
+        #plt.draw()
+        self.fig.canvas.draw_idle()
 
 def load_flux_data(filename):
     """Load flux data from meep output of a band simulation.
