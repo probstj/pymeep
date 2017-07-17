@@ -22,9 +22,9 @@ import glob
 import log
 
 class PlotOverlay:
-    def __init__(self):
+    def __init__(self, datasize):
         """A simple class that adds scatter points connected with an interpolated spline to a plot"""
-        self.values = None
+        self.values = np.ones(datasize) * -1
         self.scat = None
         self.interp_curve = None
         self.ax = None
@@ -47,9 +47,8 @@ class PlotOverlay:
             self.color = color
             # TODO: if color changes when already plotted, update self.scat and self.interp_curve
 
-        if self.values is not None:
-            self.update_plot()
-            self.update_interpolation_curve()
+        self.update_plot()
+        self.update_interpolation_curve()
 
     def set_data(self, data):
         """data values of -1 will be masked, i.e. not plotted"""
@@ -61,7 +60,10 @@ class PlotOverlay:
         return self.values is not None and len(self.values) > 0 and np.any(self.values != -1)
 
     def update_plot(self):
-        if self.ax is None:
+        if self.ax is None or not self.has_data():
+            if self.scat is not None:
+                self.scat.remove()
+                self.scat = None
             return
         X = np.nonzero(self.values != -1)[0]
         if self.scat is None:
@@ -73,7 +75,10 @@ class PlotOverlay:
             self.scat.set_offsets(np.stack((X, self.values[X])).T)
 
     def update_interpolation_curve(self):
-        if self.ax is None:
+        if self.ax is None or not self.has_data():
+            if self.interp_curve is not None:
+                self.interp_curve.remove()
+                self.interp_curve = None
             return
         X = np.nonzero(self.values != -1)[0]
         if len(X) <= 3:
@@ -114,7 +119,7 @@ class ModePicker:
             The file must not exist, it will be created when the band freqs are saved.
 
         In both filenames, you may use wildcards (*, ?), but this will only find
-        existing files (modefile will be overwritten!)
+        existing files (modefile will be overwritten when saved!)
 
         """
         if glob.has_magic(outfile):
@@ -139,7 +144,8 @@ class ModePicker:
             self.modefile = path.join(dirname, modefile)
 
         self.kdata, self.hdata = load_bands_data(outfile, freq_tolerance=-1, phase_tolerance=1001)
-        self.bands = [PlotOverlay()]
+        self.kcount = len(self.kdata)
+        self.bands = [PlotOverlay(self.kcount)]
         self.current_band_index = 0
         self.active_band = self.bands[-1]
         self.fig = None
@@ -182,7 +188,10 @@ class ModePicker:
                 data[kindex] = [count + 1, fsum + freq]
 
         # merge data from multiple points on same k-vec (mean of frequencies):
-        current = self.active_band.values
+        if self.active_band.has_data():
+            current = self.active_band.values
+        else:
+            current = np.ones(self.kcount) * -1
         for k, (count, fsum) in data.items():
             # remove frequency if already in self.mode_freqs:
             if current[k] == fsum / float(count):
@@ -196,11 +205,9 @@ class ModePicker:
         self.update_plot_with_picked_data()
 
     def new_band(self, event=None):
-        count = len(self.active_band.values)
-        self.bands.append(PlotOverlay())
+        self.bands.append(PlotOverlay(self.kcount))
         self.current_band_index = len(self.bands) - 1
         self.active_band = self.bands[self.current_band_index]
-        self.active_band.set_data(np.ones(count) * -1)
         self.active_band.add_to_axis(self.ax)
         self.bcurr.label.set_text(str(self.current_band_index))
         self.bcurr.color = self.active_band.color
@@ -279,11 +286,12 @@ class ModePicker:
     def save_mode_freqs(self, event=None):
         count = len(self.bands)
         # don't save last empty band
-        if not self.bands[-1].has_data():
+        if not self.bands[-1].has_data() and count > 1:
             count -= 1
-        mode_freqs = np.ones((count, len(self.bands[0].values))) * -1
+        mode_freqs = np.ones((count, self.kcount)) * -1
         for i in range(count):
-            mode_freqs[i] = self.bands[i].values
+            if self.bands[i].values is not None:
+                mode_freqs[i, :len(self.bands[i].values)] = self.bands[i].values[:self.kcount]
         np.savetxt(self.modefile, mode_freqs)
 
     def load_mode_freqs(self):
@@ -291,8 +299,9 @@ class ModePicker:
         The current bands will be overwritten.
 
         """
-        if path.isfile(self.modefile):
-            mode_freqs = np.loadtxt(self.modefile, ndmin=2)
+        if not path.isfile(self.modefile):
+            return
+        mode_freqs = np.loadtxt(self.modefile, ndmin=2)
         # patch to update old-style, single-band modefiles:
         if mode_freqs.shape[0] > 1 and mode_freqs.shape[1] == 1:
             mode_freqs = mode_freqs.T
@@ -302,7 +311,7 @@ class ModePicker:
             del self.bands[-1]
         # add lacking bands:
         while len(self.bands) < count:
-            self.bands.append(PlotOverlay())
+            self.bands.append(PlotOverlay(self.kcount))
         for i, band in enumerate(self.bands):
             band.set_data(mode_freqs[i])
             band.add_to_axis(self.ax)
@@ -325,7 +334,6 @@ class ModePicker:
         """
         if isinstance(mode_freqs, PlotOverlay):
             mode_freqs = mode_freqs.values
-        count = len(self.active_band.values)
         if bandnum == -1 or bandnum >= len(self.bands):
             if bandnum == -1 and not self.bands[-1].has_data():
                 # remove empty last band, but reuse color:
@@ -333,7 +341,7 @@ class ModePicker:
                 del self.bands[-1]
             else:
                 color = None
-            self.bands.append(PlotOverlay())
+            self.bands.append(PlotOverlay(self.kcount))
             self.bands[-1].add_to_axis(self.ax, color)
             dest = len(self.bands) - 1
         else:
@@ -341,9 +349,9 @@ class ModePicker:
 
         self.active_band = self.bands[dest]
         self.current_band_index = dest
-        newvals = np.ones(count) * -1
+        newvals = np.ones(self.kcount) * -1
 
-        for k, freq in enumerate(mode_freqs[:count]):
+        for k, freq in enumerate(mode_freqs[:self.kcount]):
             if freq == -1:
                 continue
             # maximum amplitude of modes at k, needed for normalization:
