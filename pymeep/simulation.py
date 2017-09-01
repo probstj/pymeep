@@ -345,7 +345,7 @@ class Simulation(object):
             fig_filename = None
             self.patts_simulated = self.find_modes_with_calculated_patterns()
             try:
-                self.patts_to_sim = np.loadtxt(path.join(self.workingdir, 'patterns_to_simulate'))
+                self.patts_to_sim = np.loadtxt(path.join(self.workingdir, 'patterns_to_simulate'), ndmin=2)
             except IOError:
                 self.patts_to_sim = None
         else:
@@ -397,10 +397,19 @@ class Simulation(object):
         return np.array(result)
 
     def onclick(self, event):
-        """This is the default function called if the bands are plotted with a
-        picker supplied and the user clicks on a vertex in the plot. It then just
+        """This is the function called if the bands are plotted with a
+        picker supplied and the user clicks on a vertex in the plot. It then
         prints some information about the vertex(ices) clicked on to stdout,
         including the mode, the k-vector and -index and the frequency(ies).
+
+        The k-index, the frequency and a default bandwidth (should be adjusted
+        manually later) is added to a file ('patterns_to_simulate') which can
+        be used later to selectively excite a single mode and save the mode
+        pattern in another simulation.
+        On the other hand, if the mode pattern was already simulated in this
+        way, there should exist a subfolder with the name
+        'pattern_k{0:03.0f}_f{1:.4f}'.format(kindex, frequency).replace('.', 'p').
+        Then a new figure is displayed with all pngs found in this subfolder.
 
         """
         try:
@@ -414,6 +423,7 @@ class Simulation(object):
             print('error getting event data')
             return
 
+        print()
         for i in ind:
             kindex = thisline.indexes[0, i]
             bandindex = thisline.indexes[1, i]
@@ -424,7 +434,6 @@ class Simulation(object):
             s = 'picker_index={0}, band_index={1}, k_index={2:.0f}, k_vec={3}, freq={4}'.format(
                 i, bandindex, kindex, kvec, freq)
             print(s + '; ')
-        print()
 
         ## display mode pattern if it was exported;
         patterndir = path.join(
@@ -438,7 +447,6 @@ class Simulation(object):
                 f.write("{0:.0f}\t{1:.4f}\t{2:.4f}\n".format(kindex, freq, defaults.mode_pattern_sim_df))
             # mark the mode in the plot:
             s = plt.scatter([kindex], [freq], facecolors='none', edgecolors='r', s=100)
-            print('scatter', s)
             plt.show()
 
         if path.exists(patterndir):
@@ -447,7 +455,13 @@ class Simulation(object):
             cnt = len(pngs)
             if not cnt:
                 return
-        
+            print('displaying all pngs in folder: %s' % patterndir)
+            # print the frequencies found in the simulation to stdout, to make sure only one mode was excited:
+            with open(path.join(patterndir, glob1(patterndir, '*.out')[0])) as f:
+                for line in f:
+                    if line.startswith('harminv'):
+                        print(line.rstrip())
+
             # Start interactive mode:
             plt.ion()
             # create a new popup figure:

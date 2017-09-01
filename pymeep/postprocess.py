@@ -17,18 +17,30 @@ from os import path
 import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.widgets import Button
-from scipy.interpolate import InterpolatedUnivariateSpline
+from scipy import interpolate
 import glob
 import log
 
 class PlotOverlay:
-    def __init__(self, datasize):
-        """A simple class that adds scatter points connected with an interpolated spline to a plot"""
+    def __init__(self, datasize,
+                 first_point_zero_deriv=True, last_point_zero_deriv=True):
+        """A simple class that adds scatter points connected with
+        an interpolated spline to a plot.
+
+        If the first or last data point belong to a k-vector at the
+        brilluoin zone edge, *first_point_zero_deriv* or
+        *last_point_zero_deriv* must be true, respectively. This will
+        result in the interpolation curve at those points having a first
+        derivate of zero.
+
+        """
         self.values = np.ones(datasize) * -1
         self.scat = None
         self.interp_curve = None
         self.ax = None
         self.color = None
+        self.first_point_zero_deriv = bool(first_point_zero_deriv)
+        self.last_point_zero_deriv = bool(last_point_zero_deriv)
 
     def __del__(self):
         if self.scat:
@@ -51,7 +63,8 @@ class PlotOverlay:
         self.update_interpolation_curve()
 
     def set_data(self, data):
-        """data values of -1 will be masked, i.e. not plotted"""
+        """data values of -1 will be masked, i.e. not plotted.
+        """
         self.values = np.copy(data)
         self.update_plot()
         self.update_interpolation_curve()
@@ -90,7 +103,12 @@ class PlotOverlay:
 
         # interpolate data, using cubic spline:
         try:
-            f_interp = InterpolatedUnivariateSpline(X, self.values[X], k=3)
+            f_interp = interpolate.CubicSpline(
+                    X, self.values[X],
+                    bc_type=map(
+                            ['not-a-knot', 'clamped'].__getitem__,
+                            [self.first_point_zero_deriv,
+                             self.last_point_zero_deriv]))
         except:
             raise ValueError('could not interpolate', X, self.values[X])
         # small steps in x for the interpolated curve:
@@ -145,7 +163,25 @@ class ModePicker:
 
         self.kdata, self.hdata = load_bands_data(outfile, freq_tolerance=-1, phase_tolerance=1001)
         self.kcount = len(self.kdata)
-        self.bands = [PlotOverlay(self.kcount)]
+
+        # I'll assume here we have a rectangular brillouin zone:
+        kv = self.kdata[0]
+        self.first_point_zero_deriv = (
+                np.abs(np.linalg.norm(kv)) < 1e-6 or
+                np.abs(np.linalg.norm(kv - [0.5, 0, 0])) < 1e-6 or
+                np.abs(np.linalg.norm(kv - [0, 0.5, 0])) < 1e-6 or
+                np.abs(np.linalg.norm(kv - [0, 0, 0.5])) < 1e-6)
+        kv = self.kdata[-1]
+        self.last_point_zero_deriv = (
+                np.abs(np.linalg.norm(kv)) < 1e-6 or
+                np.abs(np.linalg.norm(kv - [0.5, 0, 0])) < 1e-6 or
+                np.abs(np.linalg.norm(kv - [0, 0.5, 0])) < 1e-6 or
+                np.abs(np.linalg.norm(kv - [0, 0, 0.5])) < 1e-6)
+
+        self.bands = [
+                PlotOverlay(self.kcount,
+                            self.first_point_zero_deriv,
+                            self.last_point_zero_deriv)]
         self.current_band_index = 0
         self.active_band = self.bands[-1]
         self.fig = None
@@ -205,7 +241,10 @@ class ModePicker:
         self.update_plot_with_picked_data()
 
     def new_band(self, event=None):
-        self.bands.append(PlotOverlay(self.kcount))
+        self.bands.append(
+                PlotOverlay(self.kcount,
+                            self.first_point_zero_deriv,
+                            self.last_point_zero_deriv))
         self.current_band_index = len(self.bands) - 1
         self.active_band = self.bands[self.current_band_index]
         self.active_band.add_to_axis(self.ax)
@@ -311,24 +350,70 @@ class ModePicker:
             del self.bands[-1]
         # add lacking bands:
         while len(self.bands) < count:
-            self.bands.append(PlotOverlay(self.kcount))
+            self.bands.append(
+                PlotOverlay(self.kcount,
+                            self.first_point_zero_deriv,
+                            self.last_point_zero_deriv))
         for i, band in enumerate(self.bands):
             band.set_data(mode_freqs[i])
             band.add_to_axis(self.ax)
         self.current_band_index = 0
         self.update_plot_with_picked_data()
 
-    def overlay_freqs_positions(self, mode_freqs, color='g', size=100):
+    def get_band(self, band_index, interpolate_missing=False):
+        """Return picked band with index *band_index*.
+        Set *interpolate_missing* to return interpolated frequencies
+        instead of -1 at k-vectors where no frequency was picked.
+        The interpolation will be done with a cubic spline through
+        the picked frequencies.
+
+        """
+        try:
+            band = self.bands[band_index]
+        except IndexError:
+            raise IndexError('ModePicker.get_band: band_index %i exceeds '
+                             'number of available bands.' % band_index)
+        if not interpolate_missing:
+            return band.values[:]
+
+        # only use picked k-vecs for interpolation:
+        X = np.nonzero(band.values != -1)[0]
+        if len(X) <= 3:
+            # too little points. Don't interpolate.
+            return band.values[:]
+
+        # interpolate data, using cubic spline
+        try:
+            f_interp = interpolate.CubicSpline(
+                    X, band.values[X],
+                    bc_type=map(
+                            ['not-a-knot', 'clamped'].__getitem__,
+                            [self.first_point_zero_deriv,
+                             self.last_point_zero_deriv]))
+        except:
+            raise ValueError('could not interpolate', X, band.values[X])
+        return f_interp(np.arange(len(band.values)))
+
+    def overlay_freqs_positions(
+            self, mode_freqs, color='g', size=100, label=None):
         if self.ax is None:
             return
         if isinstance(mode_freqs, PlotOverlay):
             mode_freqs = mode_freqs.values
+        mode_freqs = np.array(mode_freqs)
         X = np.nonzero(mode_freqs != -1)[0]
-        return self.ax.scatter(X, mode_freqs[X], facecolors='none', edgecolors=color, s=size)
+        return self.ax.scatter(
+            X, mode_freqs[X], facecolors='none', edgecolors=color, s=size,
+            label=label)
 
-    def initialize_from_approx_freqs(self, mode_freqs, bandnum=-1):
-        """Snap frequencies provided in band_freqs to nearest mode in data with low error and high amplitude.
-        If bandnum == -1, a new band will be added (or last band overwritten if it only contains -1 freqs),
+    def initialize_from_approx_freqs(
+            self, mode_freqs, snap_to_modes=True, bandnum=-1):
+        """Snap frequencies provided in band_freqs to nearest mode in
+        data with low error and high amplitude.
+        If *snap_to_modes* if False, this snapping will not take place,
+        the *mode_freqs* will stay as given.
+        If *bandnum* == -1, a new band will be added (or last band
+        overwritten if it only contains -1 freqs),
         otherwise bandnum specifies which band to overwrite.
 
         """
@@ -337,11 +422,14 @@ class ModePicker:
         if bandnum == -1 or bandnum >= len(self.bands):
             if bandnum == -1 and not self.bands[-1].has_data():
                 # remove empty last band, but reuse color:
-                color = np.copy(self.bands[-1].color)
+                color = self.bands[-1].color
                 del self.bands[-1]
             else:
                 color = None
-            self.bands.append(PlotOverlay(self.kcount))
+            self.bands.append(
+                PlotOverlay(self.kcount,
+                            self.first_point_zero_deriv,
+                            self.last_point_zero_deriv))
             self.bands[-1].add_to_axis(self.ax, color)
             dest = len(self.bands) - 1
         else:
@@ -349,30 +437,35 @@ class ModePicker:
 
         self.active_band = self.bands[dest]
         self.current_band_index = dest
-        newvals = np.ones(self.kcount) * -1
 
-        for k, freq in enumerate(mode_freqs[:self.kcount]):
-            if freq == -1:
-                continue
-            # maximum amplitude of modes at k, needed for normalization:
-            maxamp = self.hdata[k, :, 3].max()
-            # rate modes in hdata:
-            rating = np.zeros(len(self.hdata[k]))
-            for i in range(len(rating)):
-                if self.hdata.mask[k, i, 0]:
-                    # ignore masked frequency:
-                    rating[i] = -np.inf
+        if snap_to_modes:
+            newvals = np.ones(self.kcount) * -1
+
+            for k, freq in enumerate(mode_freqs[:self.kcount]):
+                if freq == -1:
                     continue
-                # higher frequency distance leads to worse rating:
-                rating[i] -= abs(freq - self.hdata[k, i, 0]) * 500
-                # higher amplitude gives higher rating:
-                rating[i] += self.hdata[k, i, 3] / maxamp
-                # log of error (which is negative) is substracted from rating:
-                rating[i] -= np.log(self.hdata[k, i, 6]) / 10
-            winner = rating.argmax()
-            newvals[k] = self.hdata[k, winner, 0]
+                # maximum amplitude of modes at k, needed for normalization:
+                maxamp = self.hdata[k, :, 3].max()
+                # rate modes in hdata:
+                rating = np.zeros(len(self.hdata[k]))
+                for i in range(len(rating)):
+                    if self.hdata.mask[k, i, 0]:
+                        # ignore masked frequency:
+                        rating[i] = -np.inf
+                        continue
+                    # higher frequency distance leads to worse rating:
+                    rating[i] -= abs(freq - self.hdata[k, i, 0]) * 500
+                    # higher amplitude gives higher rating:
+                    rating[i] += self.hdata[k, i, 3] / maxamp
+                    # log of error (which is negative) is substracted from rating:
+                    rating[i] -= np.log(self.hdata[k, i, 6]) / 10
+                winner = rating.argmax()
+                newvals[k] = self.hdata[k, winner, 0]
 
-        self.active_band.set_data(newvals)
+            self.active_band.set_data(newvals)
+        else:
+            self.active_band.set_data(mode_freqs)
+
         self.update_plot_with_picked_data()
 
     def update_plot_with_picked_data(self):
@@ -415,34 +508,34 @@ def load_bands_data(
     """Load harminv data and kvecs from meep output of a band simulation.
 
     The simulation can have one or two harminv output points.
-    After the harminv data output, the k-vector components must be output on a line prefixed 
-    with 'freqs:, ', like here: 
+    After the harminv data output, the k-vector components must be output on a line prefixed
+    with 'freqs:, ', like here:
     https://www.mail-archive.com/meep-discuss@ab-initio.mit.edu/msg02965.html.
-    If two harminv outputs, the harminv data will be filtered, such that only the 
-    best matching frequencies (within freq_tolerance) whose amplitudes are correctly phase related 
+    If two harminv outputs, the harminv data will be filtered, such that only the
+    best matching frequencies (within freq_tolerance) whose amplitudes are correctly phase related
     will be returned, based on discussion from here:
     https://www.mail-archive.com/meep-discuss@ab-initio.mit.edu/msg02971.html
-        
+
     :param freq_tolerance:
-        only frequencies whose difference between the two points is within this 
+        only frequencies whose difference between the two points is within this
         tolerance will be considered. Ignored if only one harminv output in file.
     :param phase_tolerance:
         frequencies whose amplitudes are not related between the two points by
-        exp(ikx) within this tolerance will be rejected 
+        exp(ikx) within this tolerance will be rejected
         (k being the k vector and x the lattice vector).
         Ignored if only one harminv output in file.
     :param lattice_vector:
         the lattice vector between the two harminv points. duh.
         Ignored if only one harminv output in file.
-    :param maxbands: 
+    :param maxbands:
         maximum number of bands to load; bands above this limit will be truncated
-        (with a warning), unused bands upto this limit will be filled up with -1 and masked. 
+        (with a warning), unused bands upto this limit will be filled up with -1 and masked.
 
     :return:
         two numpy arrays in a tuple: (k-vectors, harminv data)
         k-vectors dimension: (number of simulated kvecs, 3)
         harminv data dimension: (number of simulated kvecs, maxbands, 7),
-        with the last dimension consisting of 
+        with the last dimension consisting of
         real frequency, imag. freq., Q, absolute amplitude, real amplitude, imag. amplitude, harminv error
     """
 
@@ -454,8 +547,8 @@ def load_bands_data(
             print('Warning: Globbing found multiple matching filenames, but will only use first one.')
         # only load the first one found:
         filename = names[0]
-        
-    # first load the kvec data, 
+
+    # first load the kvec data,
     # and while we're at it, also check how many harminv outputs we have:
     kvecs = []
     harminv_outputs=0
@@ -471,13 +564,13 @@ def load_bands_data(
                 first_harminv_line = line
                 harminv_outputs = 1
             else:
-                # We found a line starting with harminv before. 
-                # If it is exactly the same than the first harminv line we found, 
+                # We found a line starting with harminv before.
+                # If it is exactly the same than the first harminv line we found,
                 # i.e. also a header with the same number behind 'harminv', then
                 # it must be a harminv output at another point.
                 if line == first_harminv_line:
                     harminv_outputs += 1
-    kvecs = np.array(kvecs)        
+    kvecs = np.array(kvecs)
     #print('found harminv outputs at %i points' % harminv_outputs)
     if not harminv_outputs:
         raise BaseException("No harminv data found in file %s" % filename)
@@ -488,7 +581,7 @@ def load_bands_data(
     # now load the harminv data
 
     # 3rd dim: frequency, imag. freq., Q, abs amp, amp.real, amp.imag, harminv error:
-    harminvs1 = -1 * np.ones((len(kvecs), maxbands, 7)) 
+    harminvs1 = -1 * np.ones((len(kvecs), maxbands, 7))
     harminvs2 = -1 * np.ones_like(harminvs1)
     harminvs1[:, :, -1] = 1 # unspecified error should not be negative
     harminvs2[:, :, -1] = 1
@@ -527,12 +620,12 @@ def load_bands_data(
         if line.startswith('freqs:'):
             kind += 1
             #print 'finished loading kvec #%i' % kind
-            
+
     if harminv_outputs == 2 and freq_tolerance != -1:
         # filter the frequencies:
         harminvs1 = filter_frequencies(
-            kvecs, harminvs1, harminvs2, 
-            phase_tolerance=phase_tolerance, 
+            kvecs, harminvs1, harminvs2,
+            phase_tolerance=phase_tolerance,
             freq_tolerance=freq_tolerance,
             lattice_vector=lattice_vector)
     return kvecs, defrag_freqs(harminvs1)
@@ -540,16 +633,16 @@ def load_bands_data(
 
 def shipping(flist1, flist2, frequency_tolerance = 0.01):
     """Make a 'shipping diagramm' ;P, matching the frequencies in flist1 to flist2.
-    
+
     Frequencies of -1 will be ignored.
-    
+
     :param: flist1, flist2: 1d arrays with frequencies to match
     :param: frequency_tolerance: frequency differences bigger than this will not be matched.
-    
-    :return: an array with the same length than flist1. 
-        Its entries are the index of the matching line of flist2, 
+
+    :return: an array with the same length than flist1.
+        Its entries are the index of the matching line of flist2,
         or -1 if no match was found for the particular frequency in flist1
-        
+
     """
     # build points table:
     points_table = np.zeros((len(flist1), len(flist2)))
@@ -563,7 +656,7 @@ def shipping(flist1, flist2, frequency_tolerance = 0.01):
             if d == 0:
                 points_table[i, j] = float('inf')
             points_table[i, j] = 1.0 / d
-            
+
     # build list of matches; first match pair with highest score
     result = np.ones_like(flist1, dtype=np.int) * -1
     index = np.unravel_index(np.argmax(points_table), points_table.shape)
@@ -574,47 +667,47 @@ def shipping(flist1, flist2, frequency_tolerance = 0.01):
         points_table[index[0], :] = 0
         points_table[:, index[1]] = 0
         index = np.unravel_index(np.argmax(points_table), points_table.shape)
-        
+
     return result
 
 def filter_frequencies(kvec_data, harminv1_data, harminv2_data, phase_tolerance=0.3, freq_tolerance=0.01,
                       lattice_vector=(np.sqrt(3.0)/2.0, 0.5, 0)):
     """Filter harminv data from two harminv points, separated by a lattice vector.
-    
+
     Based on discussion from here:
     https://www.mail-archive.com/meep-discuss@ab-initio.mit.edu/msg02971.html
-    
+
     :param kvec_data:
         k-vectors numpy array with dimension: (number of simulated kvecs, 3)
     :param harminv1_data, harminv2_data:
-        harminv data numpy arrays with dimension: 
+        harminv data numpy arrays with dimension:
         (number of simulated kvecs, number of bands, 6),
-        with the last dimension consisting of 
+        with the last dimension consisting of
         real frequency, imag. freq., Q, real amplitude, imag. amplitude, harminv error;
         Note: All frequencies of -1 within this data will be ignored & masked
     :param freq_tolerance:
-        only frequencies whose difference between the two points is within this 
+        only frequencies whose difference between the two points is within this
         tolerance will be considered
     :param phase_tolerance:
         frequencies whose amplitudes are not related between the two points by
-        exp(ikx) within this tolerance will be rejected 
+        exp(ikx) within this tolerance will be rejected
         (k being the k vector and x the lattice vector)
     :param lattice_vector:
-        the lattice vector. duh. 
-        
+        the lattice vector. duh.
+
     :return:
-        a masked numpy array with the filtered frequencies. 
+        a masked numpy array with the filtered frequencies.
         Dimension: (number of simulated kvecs, number of bands in harminv1_data, 6),
-        with the last dimension consisting of 
+        with the last dimension consisting of
         real frequency, imag. freq., Q, real amplitude, imag. amplitude, harminv error;
         All rejected frequencies will be -1 and masked.
-    
+
     """
     R = np.array(lattice_vector) # lattice vector
-    
+
     # 3rd dimension: (freq (re & im), Q-value, amplitude (re & im), error):
     result = -1 * np.ones((len(kvec_data), harminv1_data.shape[1], harminv1_data.shape[2]))
-    
+
     for k, kvec in enumerate(kvec_data):
         # match up the frequencies:
         mlist = shipping(harminv1_data[k, :, 0], harminv2_data[k, :, 0], freq_tolerance)
@@ -657,7 +750,7 @@ def defrag_freqs(freqs):
         else:
             numb = np.count_nonzero(freqs[i, :, 0] + 1)
         maxb = max(numb, maxb)
-        
+
     result = -1 * np.ones((freqs.shape[0], maxb, freqs.shape[2]))
     result[:, :, -1] = 1 # unspecified error should not be negative
     for i in range(freqs.shape[0]):
@@ -670,7 +763,19 @@ def defrag_freqs(freqs):
 
 def get_steps_dict(containing_folder, jobname_regex, datafile_suffix, regroup_to_key_func=lambda x:int(x)):
     """Return a dict with simulation-steps as keys and the data file names as values
-    
+
+    containing_folder: The folder which contain the job folders. (That is, not the folder that contains the
+    data file, but one level higher.)
+
+    jobname_regex: Only folders (inside containing_folder) matching the regex will be considered. Additionally,
+    the regex must contain one group, which will be the keys to the returned dictionary.
+
+    datafile_suffix: This suffix will be appended to the found job folder name (found by matching with jobname_regex)
+    to build the returned file name (file inside the found job folder, which is inside containing_folder), for each
+    found job folder. It will not be tested if this file actually exists, only added to the returned dictionary values.
+    Depending on how the returned values are used, you are therefore free to add wildcards or formatting rules etc.
+    If datafile_suffix is None, the returned dictionary values will only contain the found job folder, no file names.
+
     regroup_to_key_func: this function will take the first group extracted by jobname_regex and
     its return value will be the dict key."""
     from os import listdir
@@ -685,14 +790,19 @@ def get_steps_dict(containing_folder, jobname_regex, datafile_suffix, regroup_to
     for fname in folders:
         m = re.match(jobname_regex, fname)
         if m is not None and len(m.groups()) > 0:
-            file = path.join(containing_folder, fname, fname + datafile_suffix)
+            if datafile_suffix is None:
+                file = path.join(containing_folder, fname)
+            else:
+                file = path.join(containing_folder, fname, fname + datafile_suffix)
             fdict[regroup_to_key_func(m.groups()[0])] = file
-            
+        elif m:
+            print('Match found, but no group specified: %s' % m.string)
+
     return fdict
 
 
 def plot_bands(
-        kvecs, harminv_data, draw_light_line=False, maxq=None, 
+        kvecs, harminv_data, draw_light_line=False, maxq=None,
         filename=None, onpick=None, modes_with_calculated_patterns=None, mode_patterns_to_be_calculated=None,
         y_range=None, gap=None, coldataindex=1, coldatalabel='abs(freq.imag)', show=True):
     """Plot bands of triangular lattice from meep-harminv simulation."""
@@ -722,22 +832,24 @@ def plot_bands(
             plt.plot(kaxis, np.linalg.norm(kvecs[kaxis, :], axis=1), c='gray')
         scat = plt.scatter(
             kaxis, harminv_data[:, bind, 0], s=sizedata[:, bind], cmap='jet',
-            c=coldata[:, bind], vmin=0, vmax=maxq, 
+            c=coldata[:, bind], vmin=0, vmax=maxq,
             facecolors='none', alpha=0.75)#color=next(colours))
-    
+
+    plt.xlabel('k-index')
+    plt.ylabel('frequency')
+
+    if mode_patterns_to_be_calculated is not None and len(mode_patterns_to_be_calculated) > 0:
+        # plot modes selected to be calculated as red circles:
+        plt.scatter(
+            mode_patterns_to_be_calculated[:, 0], mode_patterns_to_be_calculated[:, 1],
+            facecolors='none', edgecolors='r', s=100)
+
     if modes_with_calculated_patterns is not None and len(modes_with_calculated_patterns) > 0:
         # plot pre-calculated modes as green circles:
         plt.scatter(
             modes_with_calculated_patterns[:, 0], modes_with_calculated_patterns[:, 1],
             facecolors='none', edgecolors='g', s=90)
 
-    if mode_patterns_to_be_calculated is not None and len(mode_patterns_to_be_calculated) > 0:
-        # plot pre-calculated modes as green circles:
-        plt.scatter(
-            mode_patterns_to_be_calculated[:, 0], mode_patterns_to_be_calculated[:, 1],
-            facecolors='none', edgecolors='r', s=100)
-
-    
     if onpick:
         # add invisible dots for picker
         # (if picker added to plots above, the lines connecting the dots

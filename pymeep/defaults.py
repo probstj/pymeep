@@ -59,7 +59,7 @@ for meep in ['meep-mpi', 'meep']:
 
 # The source band width used in the simulations of single modes,
 # in which the mode patterns are generated:
-mode_pattern_sim_df = 0.04
+mode_pattern_sim_df = 0.01
 
 
 
