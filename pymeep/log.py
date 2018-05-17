@@ -1,6 +1,6 @@
 import logging
 import sys
-from defaults import log_format, log_datefmt
+from pymeep.defaults import log_format, log_datefmt
 
 logbuffer = []
 logger = None

@@ -19,7 +19,7 @@ from matplotlib import pyplot as plt
 from matplotlib.widgets import Button
 from scipy import interpolate
 import glob
-import log
+from pymeep import log
 
 class PlotOverlay:
     def __init__(self, datasize,

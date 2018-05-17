@@ -21,7 +21,7 @@
 from __future__ import division, print_function
 import gdspy
 import numpy as np
-import log
+from pymeep import log
 
 
 def _get_polygon_bounding_box(polygon):

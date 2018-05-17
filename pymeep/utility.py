@@ -29,8 +29,7 @@ import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import subprocess as sp
 
-import log
-import defaults
+from pymeep import log, defaults
 
 
 class ContinuousStepwiseLinearFunction:

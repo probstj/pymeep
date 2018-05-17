@@ -21,12 +21,10 @@ import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import re
 import numpy as np
-import defaults
-import postprocess
+from pymeep import defaults, postprocess, log
 from datetime import datetime
 import time
 from glob import glob1
-import log
 
 
 class Simulation(object): 
